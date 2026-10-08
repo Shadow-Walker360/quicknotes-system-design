@@ -1,460 +1,446 @@
-# QuickNotes System Architecture
+# QuickNotes — System Architecture
 
 ## 1. Overview
 
-QuickNotes is a lightweight note-taking application designed to demonstrate how a web application can evolve from a simple client into a scalable, resilient system.
+QuickNotes is a note-taking application used to explore API design, data modeling, system architecture, and reliability engineering.
 
-The current frontend uses HTML, CSS, and JavaScript to communicate with the JSONPlaceholder practice API. The architecture described in this document represents a proposed production design for a real QuickNotes backend.
+The current implementation is a frontend practice client. It communicates with JSONPlaceholder for demonstration purposes. The database, transactional outbox, worker queue, automated failover, and production infrastructure described below are **proposed production architecture**, not features currently implemented in the frontend.
 
-The production architecture separates the presentation layer, application services, data storage, caching, and asynchronous processing so each component can scale independently.
+The design aims to preserve data consistency, support horizontal scaling, recover from infrastructure failures, and avoid losing background work when individual services become unavailable.
 
-## 2. Functional Requirements
+## 2. Requirements and Capacity Planning
 
-The system should support the following capabilities:
+### Functional requirements
 
 * Retrieve and display notes.
-* Create notes with a required title and an optional body.
-* Retrieve an individual note by ID.
-* Update existing notes.
-* Delete notes.
-* Associate notes with users.
-* Validate incoming requests and return meaningful errors.
-* Process non-critical background tasks asynchronously.
-* Preserve note data during application and infrastructure failures.
+* Create a note through an API request.
+* Delete a note.
+* Validate requests and return meaningful errors.
+* Trigger background processing when a note is created.
+* Maintain consistency between persisted notes and background-processing events.
 
-## 3. Non-Functional Requirements
+### Non-functional requirements
 
-* **Availability:** Multiple application instances should continue serving requests if one instance fails.
-* **Scalability:** Application servers and workers should scale horizontally as demand increases.
-* **Performance:** Frequently requested data should be served efficiently through caching and database indexing.
-* **Durability:** Committed notes should be stored in persistent database storage with backups and recovery procedures.
-* **Security:** Use HTTPS, authentication, authorization, input validation, and rate limiting.
-* **Maintainability:** Keep application responsibilities separated and expose clear API contracts.
-* **Observability:** Collect application logs, health metrics, request latency, database health, and background-job failures.
+* Reliability and recoverability.
+* Atomic writes for related database records.
+* Idempotent handling of retried operations.
+* Horizontal scalability for API and worker services.
+* Observability through logs, metrics, and alerts.
+* Controlled database failover and backup recovery.
 
-## 4. Capacity Planning and Load Estimates
+### Illustrative capacity estimates
 
-For this design, assume the application has 1,000,000 registered users.
+Assume the system eventually supports:
 
-### Planning assumptions
+* 1,000,000 registered users.
+* 100,000 daily active users.
+* 20 note reads per active user per day.
+* One note creation per active user per day.
+* An average note size of 2 KB.
+* Peak traffic approximately five times the average rate.
 
-| Metric                         |    Assumption |
-| ------------------------------ | ------------: |
-| Registered users               |     1,000,000 |
-| Daily active users             | 100,000 (10%) |
-| Reads per active user per day  |            20 |
-| Writes per active user per day |             1 |
-| Average stored note size       |          2 KB |
-| Peak-to-average traffic ratio  |           5:1 |
-| Days per year                  |           365 |
+| Metric                           |            Estimate |
+| -------------------------------- | ------------------: |
+| Daily note reads                 |           2,000,000 |
+| Average reads per second         |               23.15 |
+| Estimated peak reads per second  |              115.74 |
+| Daily note creations             |             100,000 |
+| Average writes per second        |                1.16 |
+| Estimated peak writes per second |                5.79 |
+| Raw storage growth per year      | Approximately 73 GB |
 
-These figures are planning assumptions, not measured production traffic.
+These are planning assumptions rather than measured production traffic. Actual capacity depends on request patterns, indexes, metadata, replication, backups, retention, and note-size distribution.
 
-### Read throughput
-
-Daily reads:
-
-100,000 × 20 = 2,000,000 reads/day
-
-Average read throughput:
-
-2,000,000 ÷ 86,400 ≈ 23.15 reads/second
-
-Estimated peak throughput:
-
-23.15 × 5 ≈ 115.74 reads/second
-
-### Write throughput
-
-Daily writes:
-
-100,000 × 1 = 100,000 writes/day
-
-Average write throughput:
-
-100,000 ÷ 86,400 ≈ 1.16 writes/second
-
-Estimated peak throughput:
-
-1.16 × 5 ≈ 5.79 writes/second
-
-### Annual storage estimate
-
-Assuming each user creates one note per active day:
-
-100,000 × 2 KB × 365 = 73,000,000 KB/year
-
-This is approximately 73 GB per year using decimal units.
-
-The estimate excludes indexes, database overhead, replicas, backups, logs, and any growth in note size.
-
-### Workload characteristics
-
-QuickNotes is expected to be read-heavy, with substantially more reads than writes. Caching and read replicas can improve read performance, while the primary database remains responsible for authoritative writes.
-
-## 5. High-Level Architecture
+## 3. High-Level Architecture
 
 ```mermaid
 flowchart TD
-    U[User / Browser]
-    DNS[DNS]
-    CDN[CDN - Static Assets]
-    LB[Highly Available Load Balancer]
-    A1[Application Server 1]
-    A2[Application Server 2]
-    A3[Application Server 3]
-    CACHE[Distributed Cache]
-    PRIMARY[(PostgreSQL Primary)]
-    REPLICA[(PostgreSQL Read Replica)]
-    OUTBOX[Transactional Outbox Publisher]
-    QUEUE[Durable Job Queue]
-    W1[Worker 1]
-    W2[Worker 2]
-    DLQ[Dead-Letter Queue]
-    BACKUP[Automated Backups]
-
-    U --> DNS
-    DNS --> CDN
-    DNS --> LB
-    CDN --> U
-    LB --> A1
-    LB --> A2
-    LB --> A3
-
-    A1 --> CACHE
-    A2 --> CACHE
-    A3 --> CACHE
-
-    A1 --> PRIMARY
-    A2 --> PRIMARY
-    A3 --> PRIMARY
-
-    PRIMARY -. Replication .-> REPLICA
-    PRIMARY --> OUTBOX
-    OUTBOX --> QUEUE
-
-    QUEUE --> W1
-    QUEUE --> W2
-    W1 --> DLQ
-    W2 --> DLQ
-
-    PRIMARY --> BACKUP
+    U[Web Client] --> API[API Service]
+    API --> DB[(PostgreSQL Primary)]
+    DB --> STANDBY[(Standby Replica)]
+    DB --> OUTBOX[Transactional Outbox]
+    OUTBOX --> RELAY[Outbox Relay]
+    RELAY --> Q[Background Job Queue]
+    Q --> W[Worker Services]
+    W --> EXT[External Services]
+    API --> CACHE[(Optional Cache)]
+    DB --> OBS[Monitoring and Backups]
+    Q --> OBS
+    W --> OBS
 ```
 
-The diagram represents a proposed production architecture. The primary-to-replica connection represents database replication; the outbox publisher and queue represent asynchronous processing.
+The outbox is a logical table stored in the same database transaction as the note. It is not a separate database or an independent write to a message broker.
 
-## 6. Component Responsibilities
+### Component responsibilities
 
-### Client
+* **Web client:** Collects input, sends API requests, and displays results.
+* **API service:** Authenticates requests, validates data, applies business rules, and coordinates database transactions.
+* **PostgreSQL:** Stores notes and outbox records durably.
+* **Standby replica:** Receives database replication updates and may be promoted during a primary failure.
+* **Outbox relay:** Finds committed, unpublished outbox events and forwards them to the message broker.
+* **Message broker:** Holds jobs until workers process them.
+* **Workers:** Perform asynchronous tasks such as notifications, indexing, or other post-creation processing.
+* **Monitoring and backups:** Track failures, detect unhealthy components, and support recovery.
 
-The browser displays the interface, validates basic user input, submits API requests, and presents loading, success, empty, and error states.
+## 4. GET `/notes` Request Flow
 
-Client-side validation improves usability but does not replace server-side validation.
+1. The client sends `GET /notes`.
+2. The API authenticates and authorizes the request where required.
+3. The API validates query parameters such as pagination, filtering, and sorting.
+4. The service reads the requested notes from PostgreSQL or an optional cache.
+5. The API returns the requested notes with an appropriate HTTP status.
+6. Errors are logged with a correlation ID, without exposing sensitive information.
 
-### DNS
+Pagination should use a stable ordering, such as creation time plus a unique identifier, to reduce inconsistent results while the dataset changes.
 
-DNS resolves the application's domain to the appropriate infrastructure endpoints. Production deployments should use reliable DNS hosting and health-aware routing where appropriate.
+## 5. POST `/notes` Request Flow
 
-### CDN
+A note creation request must preserve consistency between the note itself and the event that announces its creation.
 
-The content delivery network caches static resources such as HTML, CSS, JavaScript, images, and fonts near users. Dynamic API requests are routed to the backend rather than treated as static assets.
+A naive implementation may perform two independent writes:
 
-### Load Balancer
+1. Insert the note into the database.
+2. Publish a `NoteCreated` event to a message broker.
 
-The load balancer distributes API traffic among healthy application servers. Health checks remove unhealthy instances from rotation, while redundant or managed load-balancing infrastructure reduces the risk of a single load balancer becoming a failure point.
+This creates a failure window. The database write may succeed while the broker publish fails. The note exists, but downstream processing never learns about it.
 
-### Application Servers
+The transactional outbox pattern addresses this problem by storing the note and its event in the **same database transaction**.
 
-Multiple stateless application instances process HTTP requests, enforce validation and authorization, execute business logic, and communicate with the database, cache, and queue.
+### 5.1 Step-by-step atomic transaction
 
-Because the instances are stateless, additional servers can be introduced without moving user sessions between them.
-
-### Distributed Cache
-
-The cache stores frequently requested data, such as note lists, to reduce database load and response latency.
-
-The database remains the source of truth. Cache entries should be invalidated or updated after successful writes, and cache failures should not cause the system to lose authoritative data.
-
-### PostgreSQL Primary
-
-The primary database stores authoritative note and user records and handles transactions and writes. Database constraints enforce data integrity.
-
-### PostgreSQL Read Replica
-
-A read replica receives replicated changes from the primary and can serve eligible read queries. Replication lag means a replica may briefly return stale data, so reads requiring immediate consistency should use the primary.
-
-### Durable Job Queue
-
-The queue holds asynchronous work that should not delay the main API response. It decouples request handling from background processing and supports controlled retries.
-
-### Workers
-
-Workers process queued jobs, such as notifications and other non-critical tasks. Multiple workers can run concurrently to improve throughput and resilience.
-
-### Backups
-
-Automated backups and point-in-time recovery protect against accidental deletion, data corruption, and failures that replication alone cannot correct.
-
-## 7. GET `/notes` Request Flow
-
-1. The client sends `GET /notes` over HTTPS.
-2. DNS resolves the application domain, and the load balancer routes the request to a healthy application server.
-3. The server authenticates and authorizes the request where required and validates pagination and filter parameters.
-4. The server checks the cache for a suitable note-list entry.
-5. On a cache hit, the server returns the cached result if it is valid for the request.
-6. On a cache miss, the server queries PostgreSQL. Eligible reads can use a healthy read replica; reads requiring strong read-after-write consistency use the primary.
-7. The server returns the requested notes with an appropriate HTTP status, normally `200 OK`.
-8. If caching is enabled, the result is cached according to the configured expiration and invalidation policy.
-
-If a database or application failure prevents the request from completing, the API returns an appropriate error rather than returning fabricated data.
-
-## 8. POST `/notes` Request Flow
-
-The POST flow creates a note while preserving data integrity and providing clear failure handling.
-
-### Step 1: Client submission
-
-The user enters a title and optional body and submits the form.
-
-The client checks that the title is present and no longer than 100 characters, disables the submit button while the request is running, and sends a request such as:
+Suppose the client sends:
 
 ```http
 POST /notes
 Content-Type: application/json
+Idempotency-Key: 8e0c9f3a-example
 ```
 
 Example request body:
 
 ```json
 {
-  "title": "System design notes",
-  "body": "Review caching, replication, and queue retries.",
-  "userId": 1
+  "title": "System Design",
+  "content": "Understand atomic transactions."
 }
 ```
 
-In a production system, the authenticated identity should determine the owner. The server must not trust a client-supplied `userId` as proof of ownership.
+The API executes the following sequence.
 
-### Step 2: Request routing
+**Step 1 — Validate the request**
 
-DNS resolves the domain, and the load balancer routes the request to a healthy application instance. HTTPS protects the request in transit.
+The API checks the request body, required fields, field lengths, authorization, and any applicable business rules. Invalid input is rejected before a database transaction begins.
 
-### Step 3: Validation and authorization
+**Step 2 — Begin the database transaction**
 
-The application validates the request body, verifies the user's identity and permissions, and applies rate limits.
+PostgreSQL opens a transaction. The note and its outbox event will be committed or rolled back as a unit.
 
-Invalid input receives `400 Bad Request`; missing or invalid authentication receives `401 Unauthorized`, while insufficient permissions receive `403 Forbidden`.
+**Step 3 — Insert the note**
 
-No database write occurs for a request that fails validation or authorization.
+The API inserts the note and obtains its generated identifier.
 
-### Step 4: Database transaction
+```sql
+INSERT INTO notes (id, title, content, created_at)
+VALUES (
+    :note_id,
+    :title,
+    :content,
+    CURRENT_TIMESTAMP
+);
+```
 
-The application begins a PostgreSQL transaction against the current primary and inserts the note with its owner ID and timestamps.
+Here, `:note_id`, `:title`, and `:content` represent application-supplied parameters. Production code must use parameterized queries rather than constructing SQL by concatenating user input.
 
-The database enforces relevant constraints. The transaction commits before the application reports successful creation.
+**Step 4 — Insert the corresponding outbox event**
 
-If the transaction fails, the application rolls it back and returns an appropriate error.
+Within the *same transaction*, the API writes an event describing the newly created note.
 
-### Step 5: Cache invalidation
+```sql
+INSERT INTO outbox_events (
+    event_id,
+    aggregate_type,
+    aggregate_id,
+    event_type,
+    payload,
+    created_at,
+    published_at,
+    attempts
+)
+VALUES (
+    :event_id,
+    'note',
+    :note_id,
+    'NoteCreated',
+    :event_payload,
+    CURRENT_TIMESTAMP,
+    NULL,
+    0
+);
+```
 
-After a successful commit, affected note-list cache entries are invalidated or updated.
+The payload may contain the event ID, note ID, and the minimum metadata required by downstream consumers. Avoid putting secrets or unnecessary personal information into events.
 
-If cache invalidation fails, the application records the failure for retry or relies on a short cache time-to-live to limit stale results. The cache is not treated as the authoritative store.
+**Step 5 — Commit both writes**
 
-### Step 6: Publish background work
+```sql
+COMMIT;
+```
 
-If creating a note triggers asynchronous work, such as a notification, the application schedules a background job.
+The transaction becomes durable according to the configured PostgreSQL durability settings. Both the note and its outbox event become committed together.
 
-Where reliable coordination is required, the application writes an outbox record in the same database transaction as the note. A separate publisher sends pending outbox records to the durable queue and marks them as published after successful delivery.
+If either insert fails, or the transaction cannot commit, the application rolls back:
 
-This prevents an application crash between the database commit and queue publication from silently losing the associated job.
+```sql
+ROLLBACK;
+```
 
-### Step 7: Return the response
+The rollback removes both uncommitted changes. The application must not return a successful creation response unless it knows the transaction committed.
 
-The API returns `201 Created` with the new note's ID and representation.
+**Step 6 — Return the API response**
 
-The client displays the created note, clears the form, and shows a success message.
+After a confirmed commit, the API returns `201 Created`, including the created note or its identifier.
 
-If the request fails, the client presents an appropriate error instead of claiming the note was saved.
+The API does not need to wait for the worker to finish processing the event. Background processing happens asynchronously.
 
-### Step 8: Handle ambiguous outcomes
+### 5.2 Transaction pseudocode
 
-A network failure can occur after the database commits but before the client receives the response. The client may not know whether the note was created.
+The application-level logic can be expressed as:
 
-Production clients should not blindly repeat an ambiguous POST request. An idempotency key can allow the server to recognize a retry of the same operation and avoid creating duplicate notes.
+```text
+function createNote(request):
+    validate(request)
 
-## 9. Automated Database Primary Failover
+    begin database transaction
 
-The PostgreSQL primary handles authoritative writes, while a standby replica receives replicated changes. A production deployment should use a database high-availability service or cluster manager to coordinate automated failover.
+    try:
+        note = insertNote(request.title, request.content)
 
-### Health monitoring
+        event = createNoteCreatedEvent(note)
 
-The cluster manager monitors primary health, connectivity, and replication status. A sustained failure triggers a controlled failover process.
+        insertOutboxEvent(event)
 
-A single failed health check should not automatically trigger promotion because temporary network problems can make a healthy primary appear unavailable.
+        commit transaction
 
-### Standby promotion
+        return HTTP 201 with note
+    catch error:
+        rollback transaction
+        report error
+        return appropriate failure response
+```
 
-When the primary is confirmed unavailable and split-brain safeguards are satisfied, the cluster manager selects an eligible standby and promotes it to become the new primary.
+The note insertion and outbox insertion must use the **same database connection and transaction**. Starting a separate transaction for the outbox defeats the atomicity guarantee.
 
-The potential for data loss depends on replication mode:
+This is conceptual pseudocode; it is not the current frontend's implementation.
 
-* **Synchronous replication** can reduce the risk of losing acknowledged writes, depending on the configured commit and acknowledgment policy.
-* **Asynchronous replication** generally reduces write latency but may lose recent transactions that had not reached the standby when the primary failed.
+### 5.3 Why this prevents data discrepancies
 
-### Connection recovery
+| Failure scenario                                    | Expected outcome                                                                              |
+| --------------------------------------------------- | --------------------------------------------------------------------------------------------- |
+| Note insert fails                                   | No note or outbox event is committed.                                                         |
+| Note insert succeeds, outbox insert fails           | The transaction rolls back; neither record is committed.                                      |
+| Both inserts succeed, commit succeeds               | Both records are committed.                                                                   |
+| Application crashes before commit                   | PostgreSQL rolls back the uncommitted transaction during recovery.                            |
+| API loses its connection during commit              | The outcome may be uncertain to the API; it must reconcile or safely retry using idempotency. |
+| Database commits, but the API response is lost      | The client may retry; an idempotency mechanism prevents an unintended duplicate note.         |
+| Broker is unavailable after the transaction commits | The note and outbox event remain stored; the relay retries publication later.                 |
 
-Applications connect through a stable database endpoint or proxy that identifies the current primary.
+The key guarantee is **atomic database persistence**, not atomic delivery to the message broker. The outbox relay and worker are responsible for reliable delivery and processing after the database transaction commits.
 
-After failover:
+### 5.4 Idempotency and ambiguous commit outcomes
 
-1. Existing database connections may break.
-2. Application connection pools discard broken connections.
-3. Clients reconnect to the current primary using bounded retries and backoff.
-4. In-flight transactions are treated as potentially failed and are retried only when doing so is safe.
-5. Requests return an appropriate temporary error if the database is not yet available.
+A connection failure during `COMMIT` does not necessarily mean the transaction failed. PostgreSQL may have committed successfully before the connection was lost.
 
-### Preventing split-brain writes
+To prevent duplicate notes, the API can accept an idempotency key and persist it in an idempotency table or alongside the operation, protected by a unique constraint.
 
-Only one database node should accept authoritative writes at a time.
+On a retry, the API checks the existing operation and returns its previous result instead of repeating the creation. The idempotency record must be managed consistently with the note transaction.
 
-Quorum controls, fencing, or equivalent cluster coordination prevent an isolated former primary from continuing to accept writes after another node has been promoted. Without these safeguards, independent primaries could accept conflicting changes.
+A unique event ID also helps downstream consumers identify duplicate event deliveries.
 
-### Recovery and rejoining
+## 6. Outbox Relay and Background Worker Flow
 
-After the failed primary is repaired, it must be reconciled with the active cluster and rejoined as a replica. It must not resume primary status without cluster coordination.
+The transactional outbox solves the database-to-event consistency problem. A separate relay is responsible for publishing committed outbox events to the broker.
 
-### Monitoring and recovery objectives
+### 6.1 Publishing an event
 
-Monitor:
+1. The relay searches for committed outbox events that have not been published.
+2. It claims a batch of eligible events, using a lease or row-locking strategy to coordinate multiple relay instances.
+3. It publishes each event to the message broker.
+4. After the broker acknowledges publication, the relay marks the event as published.
+5. If publication fails, the event remains eligible for retry after the lease or retry delay expires.
 
-* Primary and replica availability.
-* Replication lag.
-* Failover duration.
-* Failed database connections.
-* Recovery time and recovery point objectives.
-* Backup completion and restoration success.
+The relay must not mark an event as published before receiving the broker's acknowledgement. Otherwise, a broker failure could cause an event to be lost.
 
-Automated failover improves availability but does not guarantee zero downtime or zero data loss. Backups and point-in-time recovery remain necessary because replication can reproduce accidental deletions or corrupted changes.
+There is also a failure window in the opposite direction: the broker may accept an event, but the relay may crash before marking the database row as published. The relay may publish that event again.
 
-## 10. Worker Queue Retries and Background Job Recovery
+Consequently, the outbox normally provides **at-least-once delivery**, not exactly-once delivery. Duplicate-safe consumers are essential.
 
-Background work should run outside the synchronous API request whenever it is safe to do so. This keeps request latency predictable and allows worker capacity to scale independently.
+### 6.2 Worker queue retries
 
-### 10.1 Enqueue the job
+Workers consume jobs from the message broker and process them independently of the API request.
 
-After the relevant database transaction commits, a publisher sends the job to a durable queue.
+A robust worker should:
 
-For workflows that require reliable coordination between a database write and queue publication, the transactional outbox records the intended job in the same database transaction as the business change.
+1. Receive a job with a stable event or job ID.
+2. Check whether the operation has already been processed.
+3. Execute the work.
+4. Record successful completion.
+5. Acknowledge the job only after the required work and completion record are safely persisted.
 
-The publisher retries unsuccessful deliveries and marks an outbox record as published only after the queue has acknowledged the message. If the publisher crashes after delivery but before marking the record, the job may be delivered again; consumers must therefore tolerate duplicates.
+For transient failures, the queue retries the job using exponential backoff with jitter. For example, retry delays could increase approximately from 1 second to 2, 4, 8, and 16 seconds, with random variation. These values are illustrative and should be tuned to the service.
 
-### 10.2 Claim and process
+Each job should have a maximum retry count or age limit. Jobs that repeatedly fail are moved to a dead-letter queue for investigation and controlled replay.
 
-A worker claims a job using a lease, visibility timeout, or equivalent queue mechanism.
+### 6.3 Handling worker crashes
 
-The worker acknowledges the job only after successful processing. If it crashes or its lease expires before completion, the queue makes the job eligible for processing again.
+If a worker crashes after receiving a job but before acknowledging it, a broker visibility timeout or job lease allows the job to become available again.
 
-### 10.3 Retry transient failures
+The next worker may receive the same job. Therefore, the worker should use idempotent operations, unique processing records, or downstream idempotency keys to avoid duplicate side effects.
 
-Temporary network errors, service unavailability, and rate limits can be retried automatically.
+For example, if `NoteCreated` triggers a notification, the notification service should record a stable notification or event ID so repeated processing does not send the same notification multiple times.
 
-Use exponential backoff with jitter. For example, the approximate retry delays might be 1, 2, 4, 8, and 16 seconds, with random variation and a configured maximum delay.
+### 6.4 Outbox event lifecycle
 
-Respect a downstream service's `Retry-After` instruction when applicable.
+```mermaid
+stateDiagram-v2
+    [*] --> Pending: Transaction commits
+    Pending --> Publishing: Relay claims event
+    Publishing --> Published: Broker acknowledges
+    Publishing --> Pending: Temporary publish failure
+    Pending --> Publishing: Retry
+    Published --> [*]
+```
 
-Backoff and jitter help prevent many workers from retrying simultaneously and creating a retry storm.
+This is a simplified lifecycle. A production implementation should also represent leases, retry schedules, permanent failures, and dead-letter or manual-review states as needed.
 
-### 10.4 Bound retries
+## 7. Automated Database Failover
 
-Each job should have a configured maximum attempt count and maximum age.
+A PostgreSQL primary may become unavailable because of hardware failure, network partition, process crash, or storage problems. A standby replica and a reliable promotion process can reduce downtime.
 
-Transient failures may be retried, while permanent errors—such as an invalid payload—should not be retried indefinitely.
+### 7.1 Failover sequence
 
-When a job exhausts its retry budget, route it to a dead-letter queue or equivalent failure store. Record its ID, attempt count, timestamps, and failure reason so an operator can investigate the underlying cause.
+1. Health monitoring detects that the primary is unhealthy.
+2. A failover controller evaluates whether the primary is genuinely unavailable and whether a safe promotion is possible.
+3. The controller prevents the old primary from continuing to accept writes, using a fencing mechanism or equivalent cluster coordination.
+4. An eligible standby is promoted to primary.
+5. The database endpoint, proxy, or service discovery layer directs new connections to the promoted primary.
+6. The application discards broken connections and establishes new connections.
+7. Failed or ambiguous transactions are reconciled or retried safely using idempotency.
+8. The former primary is reinitialized or rejoined as a standby only after its state is reconciled with the current primary.
 
-### 10.5 Prevent duplicate side effects
+Failover should be automated but guarded against split-brain, where two database instances both accept writes as primary.
 
-Most durable queues provide at-least-once delivery, which means the same job may be delivered more than once.
+### 7.2 Replication trade-offs
 
-Workers must therefore be idempotent. Depending on the operation, this can include:
+* **Synchronous replication:** Can reduce the risk of losing acknowledged transactions, depending on configuration, but may increase write latency and reduce availability when replicas cannot be reached.
+* **Asynchronous replication:** Can improve write availability and latency, but a sudden primary failure may lose recently acknowledged transactions that had not reached the standby.
 
-* Using a stable job ID or idempotency key.
-* Recording completed operations.
-* Applying unique database constraints.
-* Checking whether a side effect has already occurred before repeating it.
-* Using downstream APIs that support idempotency keys.
+The recovery point objective (RPO) defines the acceptable data-loss window. The recovery time objective (RTO) defines the acceptable time to restore service. These targets must guide the replication and failover configuration.
 
-For example, retrying a notification job should not create duplicate records or send repeated messages unnecessarily.
+A stable endpoint alone is not enough: applications need connection recovery, bounded retries, transaction reconciliation, and monitoring.
 
-### 10.6 Handle queue outages
+### 7.3 Backups and recovery
 
-If the queue becomes unavailable, the publisher retries with bounded backoff.
+Replication is not a substitute for backups. Replication may copy accidental deletions or corrupted data to the standby.
 
-A transactional outbox preserves pending work in the database until publication succeeds. Monitoring should alert operators if the outbox grows continuously or pending jobs exceed their expected processing time.
+Production operations should include:
 
-The API should not wait indefinitely for non-critical background work. Its synchronous response should reflect the outcome of the primary business transaction, not the completion of every downstream task.
+* Automated backups and appropriate retention.
+* Point-in-time recovery where supported.
+* Periodic restore tests.
+* Replication-lag monitoring.
+* Alerts for failed backups and storage exhaustion.
+* Documented failover and disaster-recovery procedures.
 
-### 10.7 Monitor and recover
+## 8. Single Points of Failure and Mitigations
 
-Monitor queue depth, oldest-job age, worker health, processing duration, retry counts, dead-letter volume, and failure rate.
+| Component or risk        | Potential failure                  | Mitigation                                                |
+| ------------------------ | ---------------------------------- | --------------------------------------------------------- |
+| API instance             | Process crash or overload          | Multiple instances, health checks, load balancing         |
+| Database primary         | Primary becomes unavailable        | Standby, controlled promotion, fencing, recovery testing  |
+| Replication              | Excessive lag or standby failure   | Lag monitoring, alerts, tested recovery procedures        |
+| Database connection pool | Connection exhaustion              | Pool limits, timeouts, backpressure                       |
+| Outbox relay             | Relay stops publishing events      | Multiple relay instances, leases, monitoring, retries     |
+| Message broker           | Queue becomes unavailable          | Durable queues, suitable replication, bounded retries     |
+| Worker instance          | Crash during processing            | Job leases, retry policy, idempotent processing           |
+| External service         | Timeout or outage                  | Timeouts, backoff, circuit breakers, dead-letter handling |
+| Cache                    | Stale or unavailable data          | Cache expiry, invalidation, database fallback             |
+| Backup system            | Backup failure or unusable restore | Alerts and scheduled restore tests                        |
 
-Operators should investigate the underlying cause before replaying dead-lettered jobs. Replay should be controlled and idempotent to avoid duplicating side effects.
+Retries must be bounded and coordinated. Aggressive retries during an outage can increase load and make recovery harder.
 
-## 11. Single Points of Failure and Resilience
+## 9. Data Model Considerations
 
-A single point of failure (SPOF) is a component whose failure can make the entire application or a critical function unavailable.
+A production PostgreSQL implementation may include the following logical tables.
 
-| Component           | Failure risk                                                 | Mitigation                                                                                                           |
-| ------------------- | ------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------------------- |
-| Application server  | A crashed instance stops serving requests.                   | Run multiple instances behind a load balancer with health checks.                                                    |
-| Load balancer       | A single load-balancing instance can interrupt API access.   | Use a managed or redundant load-balancing service.                                                                   |
-| PostgreSQL primary  | Writes fail while the primary is unavailable.                | Maintain a replicated standby and use a cluster manager for controlled automated failover.                           |
-| Read replica        | Read capacity decreases or replica reads become unavailable. | Route reads to healthy replicas or fall back to the primary when safe and capacity permits.                          |
-| Cache               | Cached reads fail or response times increase.                | Treat PostgreSQL as the source of truth and use bounded timeouts and safe fallback behavior.                         |
-| Job queue           | Background processing pauses or jobs cannot be published.    | Use durable queue infrastructure, publisher retries, and a transactional outbox where reliable delivery is required. |
-| Worker              | A worker crash leaves jobs unfinished.                       | Run multiple workers and use leases or visibility timeouts so unfinished jobs can be retried.                        |
-| Storage and backups | Data loss or corruption affects recovery.                    | Use durable storage, automated backups, point-in-time recovery, and tested restoration procedures.                   |
-| Monitoring service  | Failures may go undetected.                                  | Use independent monitoring and alerting paths where practical.                                                       |
+### `notes`
 
-### Important resilience trade-offs
+* `id`: primary key.
+* `title`: note title.
+* `content`: note content.
+* `created_at`: creation timestamp.
+* `updated_at`: last update timestamp, if applicable.
 
-Redundancy improves availability but increases infrastructure cost and operational complexity.
+### `outbox_events`
 
-Database replication lag can produce stale reads. Asynchronous replication may lose recent acknowledged writes during failover, while synchronous replication can increase write latency or reduce write availability if the required replicas cannot acknowledge commits.
+* `event_id`: unique event identifier.
+* `aggregate_type`: entity type, such as `note`.
+* `aggregate_id`: identifier of the affected note.
+* `event_type`: event name, such as `NoteCreated`.
+* `payload`: serialized event data.
+* `created_at`: event creation timestamp.
+* `published_at`: timestamp of successful broker publication, initially null.
+* `attempts`: number of publication attempts.
+* Additional lease and retry fields, if required by the relay design.
 
-Retries improve resilience but can increase load during an outage. Exponential backoff, jitter, bounded attempts, and circuit breakers help prevent retry storms.
+Useful indexes may include a unique index on `event_id` and an index supporting retrieval of unpublished events by publication status and creation time. Index choices should be based on actual query patterns and operational testing.
 
-Caching improves read performance but introduces invalidation complexity and potential staleness.
+An idempotency table can store the idempotency key, operation status, and response reference, with a uniqueness constraint scoped to the appropriate client or account.
 
-Automated failover and queue retries are proposed production design features. They are not implemented by the current static frontend, which uses JSONPlaceholder as a practice API.
+Retention policies should prevent the outbox and idempotency tables from growing without limit while preserving sufficient records for debugging and safe recovery.
 
-## 12. Design Trade-offs
+## 10. Architectural Trade-offs
 
-### SQL versus NoSQL
+### PostgreSQL versus NoSQL
 
-PostgreSQL is suitable for QuickNotes because notes have clear ownership relationships and benefit from transactions, relational constraints, and structured queries.
+PostgreSQL is a strong default for this design because the note and outbox event require transactional consistency and relational constraints. It also supports indexes, structured querying, and mature recovery tooling.
 
-A document-oriented database could also store notes, but it would not automatically provide a better solution for this workload. The choice should follow access patterns, consistency requirements, operational expertise, and scaling needs.
+A NoSQL database may be appropriate for different access patterns or scale requirements, but the design must establish whether its transaction and consistency guarantees support the same atomic note-plus-event operation.
 
-### Cache versus database reads
+### Synchronous work versus asynchronous work
 
-Caching reduces database load and latency for frequently requested data. However, cache invalidation and expiration rules must be designed carefully to avoid serving stale results.
+Synchronous work gives the client an immediate result but increases request latency and ties API availability to downstream services.
 
-### Synchronous versus asynchronous processing
+Asynchronous work lets the API acknowledge a committed note without waiting for every downstream task. It introduces queue operations, eventual consistency for derived data, retries, monitoring, and duplicate-handling requirements.
 
-Synchronous processing is appropriate for operations whose outcome must be known before returning a response, such as committing a note.
+### Transactional outbox versus direct publication
 
-Asynchronous processing is appropriate for work that can happen later, such as notifications. It improves responsiveness but requires durable queues, retries, idempotency, and monitoring.
+Directly publishing after a database commit is simpler but leaves a gap in which the database can commit while event publication fails.
 
-### Read replicas versus primary reads
+The transactional outbox adds storage and relay complexity, but it durably records the intent to publish in the same transaction as the business change.
 
-Read replicas increase read capacity but can lag behind the primary. The application must decide which reads can tolerate eventual consistency and which require immediate consistency.
+## 11. Observability and Operational Metrics
 
-## 13. Conclusion
+Production monitoring should include:
 
-QuickNotes begins as a small browser-based application but can evolve into a scalable production system by separating responsibilities across application servers, databases, caches, and background workers.
+* API request rate, latency, and error rate.
+* Database transaction failures and connection-pool saturation.
+* Primary health, replication lag, and failover duration.
+* Number and age of unpublished outbox events.
+* Relay publication failures and retry counts.
+* Queue depth, oldest job age, worker failure rate, and retry count.
+* Dead-letter queue size.
+* Backup completion and restore-test results.
 
-Horizontal scaling reduces dependence on individual application instances. Database replication and automated failover improve write availability. Durable queues, bounded retries, idempotent workers, and dead-letter handling improve background-job resilience. Automated backups and tested recovery procedures protect data beyond what replication alone can guarantee.
+Logs should carry correlation IDs, note IDs where appropriate, and event IDs. Sensitive note content should not be logged by default.
 
-These design choices provide a practical foundation for scaling the application while making the trade-offs in availability, consistency, performance, and operational complexity explicit.
+Alert thresholds should reflect the system's reliability targets rather than arbitrary values.
+
+## 12. Conclusion
+
+QuickNotes demonstrates how a simple note-taking workflow can evolve into a resilient distributed system.
+
+The central consistency principle is that the note and its outbox event must be inserted within the same database transaction. If either write fails, the transaction rolls back. Once committed, the outbox relay can retry publication independently, while queue workers use bounded retries, durable job handling, and idempotency to manage failures.
+
+Database failover, message delivery, and background processing each have separate failure modes. Combining atomic database transactions, a transactional outbox, safe retry behavior, observability, and tested recovery procedures reduces data discrepancies and improves reliability.
+
+**Implementation status:** The current QuickNotes frontend uses JSONPlaceholder as a demonstration API. The PostgreSQL transaction, transactional outbox, message broker, worker queue, and automated failover described here are proposed architectural designs, not implemented features of the current project.
