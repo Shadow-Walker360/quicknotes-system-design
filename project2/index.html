@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>QuickNotes</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="api.js" defer></script>
+</head>
+<body>
+  <main class="container">
+    <header class="page-header">
+      <p class="eyebrow">QuickNotes</p>
+      <h1>Simple notes, connected to an API.</h1>
+      <p class="intro">
+        Load, create and delete notes using the JSONPlaceholder practice API.
+      </p>
+    </header>
+
+    <section class="panel">
+      <button id="load-btn" type="button">Load Notes</button>
+      <p id="status" class="status" aria-live="polite">
+        Click "Load Notes" to fetch your notes.
+      </p>
+    </section>
+
+    <section class="panel">
+      <h2>Create a Note</h2>
+
+      <form id="note-form">
+        <div class="field">
+          <label for="title-input">Title</label>
+          <input
+            id="title-input"
+            type="text"
+            maxlength="100"
+            placeholder="Enter a note title"
+            required
+          >
+        </div>
+
+        <div class="field">
+          <label for="body-input">Body</label>
+          <textarea
+            id="body-input"
+            rows="5"
+            placeholder="Write your note..."
+          ></textarea>
+        </div>
+
+        <button id="submit-btn" type="submit">Create Note</button>
+      </form>
+    </section>
+
+    <section class="panel">
+      <div class="notes-header">
+        <h2>Notes</h2>
+      </div>
+
+      <ul id="notes-list"></ul>
+    </section>
+  </main>
+</body>
+</html>
